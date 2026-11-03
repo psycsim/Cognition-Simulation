@@ -17,6 +17,13 @@ const nextConfig = {
     unoptimized: true,
   },
   trailingSlash: false,
+  // Analysis page is disabled for now; send direct URL visits to the dashboard
+  async redirects() {
+    return [
+      { source: '/analysis', destination: '/dashboard', permanent: false },
+      { source: '/analysis/:path*', destination: '/dashboard', permanent: false },
+    ]
+  },
   experimental: {
     webpackBuildWorker: true,
     parallelServerBuildTraces: true,

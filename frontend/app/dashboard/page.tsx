@@ -1533,6 +1533,7 @@ export default function DashboardHistory() {
         description="Manage and monitor your simulation projects"
       >
         <div className="flex gap-3">
+          {/*
           <Button
             onClick={() => setShowPDFImportModal(true)}
             className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg flex items-center gap-2"
@@ -1540,6 +1541,7 @@ export default function DashboardHistory() {
             <FileUp className="w-4 h-4" />
             Import PDF
           </Button>
+          */}
           <Button
             onClick={() => setShowNewFolderModal(true)}
             className="bg-gray-600 hover:bg-gray-700 text-white px-6 py-3 rounded-lg flex items-center gap-2"

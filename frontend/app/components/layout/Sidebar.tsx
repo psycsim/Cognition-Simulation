@@ -40,7 +40,7 @@ export default function Sidebar({ currentPage, userData }: SidebarProps) {
     { id: 'samples', href: '/samples', icon: Users, label: 'Samples' },
     { id: 'measures', href: '/measures', icon: BarChart3, label: 'Measures' },
     { id: 'simulation', href: '/simulation', icon: Activity, label: 'Simulation' },
-    { id: 'analysis', href: '/analysis', icon: LineChart, label: 'Analysis' },
+    // { id: 'analysis', href: '/analysis', icon: LineChart, label: 'Analysis' },
   ];
 
   // Keep sidebar open when navigating via sidebar links
