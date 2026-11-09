@@ -3,10 +3,12 @@ import { supabase } from "./supabase";
 /**
  * Billing helpers for the Account → Billing tab.
  *
- * Every completed simulation writes one row to the `tokens` table
- * (`backend/app.py`), holding the input/output token counts and the raw LLM
- * token cost (`total_cost`). We surface each of those rows as a debit on the
- * billing page: what the simulation cost = token cost + a flat server fee.
+ * Every billed operation writes one row to the `tokens` table
+ * (`backend/app.py`): simulations, step generation and PDF import. Each row
+ * holds the token counts, the raw LLM token cost (`total_cost`) and, since
+ * credits were introduced, what was actually deducted (`charged_amount`).
+ * Simulations pay token cost + a flat server fee; other operations pay token
+ * cost only.
  */
 
 /**
@@ -15,9 +17,16 @@ import { supabase } from "./supabase";
  */
 export const SERVER_FEE_PER_SIMULATION = 0.05;
 
+const OPERATION_LABELS: Record<string, string> = {
+  generate_steps: "AI step generation",
+  parse_pdf: "PDF import",
+};
+
 export interface SimulationCharge {
-  /** tokens.id (one row per simulation). */
+  /** tokens.id (one row per billed operation). */
   id: string;
+  /** tokens.operation: "simulation" | "generate_steps" | "parse_pdf". */
+  operation: string;
   experimentId: string;
   title: string;
   /** Pre-formatted date for display, e.g. "Apr 5, 2026". */
@@ -33,8 +42,10 @@ export interface SimulationCharge {
   tokenCost: number;
   /** Flat server/infrastructure fee for this simulation. */
   serverCost: number;
-  /** What the user is charged: tokenCost + serverCost. */
+  /** What the user is charged (charged_amount when recorded). */
   totalCost: number;
+  /** Portion of totalCost paid from free credits (null for older rows). */
+  freePortion: number | null;
 }
 
 const formatDate = (iso: string | null): string => {
@@ -67,7 +78,8 @@ export async function fetchSimulationCharges(
     .from("tokens")
     .select(
       "id, experiment_id, prompt_input_token, prompt_output_token, " +
-        "eval_input_token, eval_output_token, total_tokens, total_cost"
+        "eval_input_token, eval_output_token, total_tokens, total_cost, " +
+        "operation, created_at, charged_amount, free_portion"
     )
     .eq("user_id", userId);
 
@@ -103,18 +115,23 @@ export async function fetchSimulationCharges(
   }
 
   const charges: SimulationCharge[] = (tokenRows as any[]).map((r) => {
+    const operation: string = r.operation || "simulation";
+    const isSimulation = operation === "simulation";
     const meta = expMeta.get(r.experiment_id) ?? {
-      title: "Simulation",
+      title: OPERATION_LABELS[operation] ?? "Simulation",
       createdAt: null,
     };
+    const createdAt = meta.createdAt ?? r.created_at ?? null;
     const tokenCost = num(r.total_cost);
-    const serverCost = SERVER_FEE_PER_SIMULATION;
+    const serverCost = isSimulation ? SERVER_FEE_PER_SIMULATION : 0;
+    const charged = r.charged_amount == null ? null : num(r.charged_amount);
     return {
       id: String(r.id ?? r.experiment_id),
+      operation,
       experimentId: r.experiment_id,
       title: meta.title,
-      date: formatDate(meta.createdAt),
-      createdAt: meta.createdAt,
+      date: formatDate(createdAt),
+      createdAt,
       promptInputToken: num(r.prompt_input_token),
       promptOutputToken: num(r.prompt_output_token),
       evalInputToken: num(r.eval_input_token),
@@ -122,7 +139,8 @@ export async function fetchSimulationCharges(
       totalTokens: num(r.total_tokens),
       tokenCost,
       serverCost,
-      totalCost: Math.round((tokenCost + serverCost) * 1e6) / 1e6,
+      totalCost: charged ?? Math.round((tokenCost + serverCost) * 1e6) / 1e6,
+      freePortion: r.free_portion == null ? null : num(r.free_portion),
     };
   });
 

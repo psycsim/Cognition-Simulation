@@ -17,6 +17,8 @@ import ProjectsTable from "../components/ProjectsTable";
 import Spinner from "../components/ui/spinner";
 import PDFImportModal, { ParsedStudy } from "../components/PDFImportModal";
 import { toSampleAttributesJson } from "../data/attributeCatalog";
+import CreditsBanner from "../components/CreditsBanner";
+import { useCredits } from "../hooks/useCredits";
 
 interface SimulationHistoryItem {
   created_at: string;
@@ -91,6 +93,7 @@ interface UserData {
 export default function DashboardHistory() {
   const router = useRouter();
   const { user, isLoading, isAuthenticated } = useAuth();
+  const { credits } = useCredits(isAuthenticated);
   const [history, setHistory] = useState<SimulationHistoryItem[]>([]);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -1528,6 +1531,7 @@ export default function DashboardHistory() {
       headerTitle=""
       userData={userData}
     >
+      <CreditsBanner credits={credits} />
       <SubHeader
         title="Dashboard"
         description="Manage and monitor your simulation projects"

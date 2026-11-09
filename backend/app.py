@@ -21,18 +21,16 @@ from utils.graph import normalize_graph, validate_graph
 from utils.sampling import generate_personas, personas_match
 from utils.llm import get_llm, resolve_model_name, DEFAULT_MODEL
 from utils.progress import create_progress_updater
-try:
-    from utils.pricing import compute_prompt_and_eval_cost, compute_cost
-except ModuleNotFoundError:
-    # Fallback when utils.pricing is not deployed (e.g. missing from build context)
-    _INPUT_PER_M = 0.15
-    _OUTPUT_PER_M = 0.60
-    def compute_cost(input_tokens: int, output_tokens: int) -> float:
-        return (input_tokens * _INPUT_PER_M / 1e6) + (output_tokens * _OUTPUT_PER_M / 1e6)
-    def compute_prompt_and_eval_cost(pi: int, po: int, ei: int, eo: int, model_name: str = "gemini-2.0-flash"):
-        # model_name accepted for signature parity with the real implementation;
-        # the fallback only supports Gemini rates.
-        return (round(compute_cost(pi, po), 6), round(compute_cost(ei, eo), 6))
+from utils.llm import extract_usage
+from utils.pricing import (
+    compute_prompt_and_eval_cost,
+    compute_cost,
+    estimate_run_cost,
+    pricing_params,
+    CREDITS_PER_USD,
+    MIN_BALANCE_USD,
+    RUN_FEE_USD,
+)
 from utils.prompts import (
     GENERATE_STEPS_SYSTEM_PROMPT,
     get_generate_steps_user_prompt,
@@ -150,18 +148,16 @@ def credit_user_account(user_id, amount, session):
     # .get() don't work on StripeObject).
     md = session.metadata.to_dict() if session.metadata else {}
 
-    # Read current balance.
-    row = client.table("user_emails").select("credits").eq("user_id", user_id).execute()
-    current = 0
-    if row.data:
-        current = row.data[0].get("credits") or 0
-
     # Already credited this session — return the current balance unchanged.
     if md.get("credited") == "true":
-        return round(float(current), 2)
+        balance = get_balance(user_id)
+        return round(balance["paid"], 2) if balance else None
 
-    new_balance = round(float(current) + float(amount), 2)
-    client.table("user_emails").update({"credits": new_balance}).eq("user_id", user_id).execute()
+    # Atomic increment in Postgres (see supabase/migrations/*_credits.sql).
+    result = client.rpc("add_paid_credits", {"p_user_id": user_id, "p_amount": float(amount)}).execute()
+    new_balance = result.data if not isinstance(result.data, list) else (result.data[0] if result.data else None)
+    if isinstance(new_balance, dict):
+        new_balance = next(iter(new_balance.values()), None)
 
     # Stamp the session so it can't be credited again.
     try:
@@ -169,7 +165,114 @@ def credit_user_account(user_id, amount, session):
     except Exception as e:
         logger.warning("Could not mark session %s credited: %s", session.id, e)
 
-    return new_balance
+    return round(float(new_balance), 2) if new_balance is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Credits / billing helpers
+# ---------------------------------------------------------------------------
+
+def get_verified_user_id(jwt):
+    """Return the Supabase auth user id for a JWT, or None if invalid/missing."""
+    if not jwt:
+        return None
+    try:
+        client = get_service_client() or create_client(url, key)
+        resp = client.auth.get_user(jwt)
+        user = getattr(resp, "user", None)
+        return user.id if user else None
+    except Exception as e:
+        logger.warning("Could not verify user JWT: %s", e)
+        return None
+
+
+def jwt_from_request():
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        return auth_header.split("Bearer ")[1]
+    return None
+
+
+def get_balance(user_id):
+    """Return {"free", "paid", "total"} in USD for a user, or None on failure."""
+    client = get_service_client()
+    if client is None or not user_id:
+        return None
+    try:
+        row = client.table("user_emails").select("credits, free_credits").eq("user_id", user_id).execute()
+    except Exception as e:
+        logger.error("Could not read balance for %s: %s", user_id, e)
+        return None
+    if not row.data:
+        return {"free": 0.0, "paid": 0.0, "total": 0.0}
+    free = float(row.data[0].get("free_credits") or 0)
+    paid = float(row.data[0].get("credits") or 0)
+    return {"free": free, "paid": paid, "total": free + paid}
+
+
+def reserved_for_running(user_id, exclude_experiment_id=None):
+    """Sum of expected cost of this user's runs that are still in progress."""
+    client = get_service_client()
+    if client is None:
+        return 0.0
+    try:
+        rows = client.table("experiments").select("experiment_id, experiment_data") \
+            .eq("user_id", user_id).eq("status", "Started").execute().data or []
+    except Exception as e:
+        logger.warning("Could not read running experiments for %s: %s", user_id, e)
+        return 0.0
+    total = 0.0
+    for r in rows:
+        if exclude_experiment_id and r.get("experiment_id") == exclude_experiment_id:
+            continue
+        d = r.get("experiment_data") or {}
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except ValueError:
+                d = {}
+        steps = d.get("steps") or []
+        total += estimate_run_cost(d.get("iters") or 10, len(steps) if isinstance(steps, list) else 0)["expected"]
+    return total
+
+
+def charge_user(user_id, amount_usd):
+    """
+    Atomically deduct `amount_usd` from the user's balance (free credits first).
+    Returns {"free_portion", "paid_portion"} or None if the charge failed.
+    """
+    client = get_service_client()
+    if client is None or not user_id or amount_usd <= 0:
+        return None
+    try:
+        result = client.rpc("charge_user", {"p_user_id": user_id, "p_amount": float(amount_usd)}).execute()
+        row = result.data[0] if isinstance(result.data, list) and result.data else result.data
+        if not row:
+            logger.error("charge_user returned no row for %s (user missing?)", user_id)
+            return None
+        return {
+            "free_portion": float(row.get("free_portion") or 0),
+            "paid_portion": float(row.get("paid_portion") or 0),
+        }
+    except Exception as e:
+        logger.error("Failed to charge %s $%.6f: %s", user_id, amount_usd, e)
+        return None
+
+
+def charge_and_record(user_id, token_row_id, amount_usd):
+    """Charge the user and stamp the tokens row with what was actually deducted."""
+    charged = charge_user(user_id, amount_usd)
+    if charged is None:
+        return None
+    try:
+        get_service_client().table("tokens").update({
+            "charged_amount": round(amount_usd, 6),
+            "free_portion": round(charged["free_portion"], 6),
+        }).eq("id", token_row_id).execute()
+    except Exception as e:
+        logger.warning("Charged %s but could not record on tokens row %s: %s", user_id, token_row_id, e)
+    return charged
+
 
 # Keep GEMINI_KEY available for reference; get_llm() reads it from env directly.
 key_g = os.environ.get('GEMINI_KEY')
@@ -331,6 +434,12 @@ def run_evaluation(uuid, data, model_name, jwt=None):
             "progress": 100,
             "status": "Completed"
         }).eq("experiment_id", uuid).execute()
+
+        # Charge the user: token cost + flat run fee (free credits are used first).
+        charge_amount = round(total_cost + RUN_FEE_USD, 6)
+        if charge_and_record(data.get("user_id"), uuid, charge_amount) is None:
+            logger.error("Run %s completed but charging user %s $%.6f failed",
+                         uuid, data.get("user_id"), charge_amount)
     except Exception as e:
         logger.exception("Evaluation failed")
         # Create a new Supabase client for error handling
@@ -360,6 +469,31 @@ class Evaluation(Resource):
             uuid = request.get_json()['id']
             data = request.get_json()['data']
             model_name = resolve_model_name(data.get('model', 'gemini-2.0-flash'))
+
+            # Billing gate: the run is charged to the authenticated user, who
+            # needs at least MIN_BALANCE_USD available after reserving the
+            # expected cost of their other in-progress runs.
+            user_id = get_verified_user_id(jwt)
+            if not user_id:
+                return {"status": "error", "error": "unauthorized", "message": "Please sign in to run a simulation."}, 401
+            data = {**data, "user_id": user_id}
+            balance = get_balance(user_id)
+            if balance is None:
+                return {"status": "error", "message": "Could not check your credit balance. Please try again."}, 503
+            available = balance["total"] - reserved_for_running(user_id, exclude_experiment_id=uuid)
+            if available < MIN_BALANCE_USD:
+                return {
+                    "status": "error",
+                    "error": "insufficient_credits",
+                    "message": (
+                        f"You need at least {round(MIN_BALANCE_USD * CREDITS_PER_USD)} credits to run a simulation"
+                        + (" (including runs still in progress)" if available < balance["total"] else "")
+                        + f". You have {max(0, round(available * CREDITS_PER_USD))} available."
+                    ),
+                    "balance_credits": round(balance["total"] * CREDITS_PER_USD, 2),
+                    "available_credits": round(available * CREDITS_PER_USD, 2),
+                    "min_credits": round(MIN_BALANCE_USD * CREDITS_PER_USD),
+                }, 402
 
             supabase: Client = create_client(url, key)
             if jwt:
@@ -514,25 +648,20 @@ class GenerateSteps(Resource):
 
                 # Track token usage for generate_steps
                 try:
-                    usage_meta = lc_response.usage_metadata or {}
-                    prompt_count = usage_meta.get("input_tokens", 0) or 0
-                    output_count = usage_meta.get("output_tokens", 0) or 0
-                    total_count = usage_meta.get("total_tokens", 0) or 0
+                    usage_meta = extract_usage(lc_response)
+                    prompt_count = usage_meta["input_tokens"]
+                    output_count = usage_meta["output_tokens"]
+                    total_count = usage_meta["total_tokens"]
                     auth_header = request.headers.get("Authorization")
                     jwt = auth_header.split("Bearer ")[1] if auth_header and auth_header.startswith("Bearer ") else None
                     supabase_client = get_supabase_client(jwt)
-                    user_id = data.get("user_id")
-                    if not user_id and jwt:
-                        try:
-                            user_response = supabase_client.auth.get_user()
-                            if user_response and getattr(user_response, "user", None):
-                                user_id = user_response.user.id
-                        except Exception:
-                            pass
+                    verified_user_id = get_verified_user_id(jwt)
+                    user_id = verified_user_id or data.get("user_id")
                     if user_id is not None:
-                        gen_prompt_cost = compute_cost(prompt_count, output_count)
+                        gen_prompt_cost = compute_cost(prompt_count, output_count, DEFAULT_MODEL)
+                        token_row_id = str(uuid.uuid4())
                         supabase_client.table("tokens").insert({
-                            "id": str(uuid.uuid4()),
+                            "id": token_row_id,
                             "experiment_id": None,
                             "operation": "generate_steps",
                             "user_id": user_id,
@@ -547,6 +676,8 @@ class GenerateSteps(Resource):
                             "eval_cost": 0.0,
                             "total_cost": gen_prompt_cost,
                         }).execute()
+                        if verified_user_id:
+                            charge_and_record(verified_user_id, token_row_id, gen_prompt_cost)
                 except Exception as token_err:
                     logger.warning(f"[{request_id}] Failed to store token usage: {token_err}")
             except Exception as api_error:
@@ -976,25 +1107,20 @@ class ParsePDF(Resource):
 
                 # Track token usage for parse_pdf
                 try:
-                    usage_meta = lc_response.usage_metadata or {}
-                    prompt_count = usage_meta.get("input_tokens", 0) or 0
-                    output_count = usage_meta.get("output_tokens", 0) or 0
-                    total_count = usage_meta.get("total_tokens", 0) or 0
+                    usage_meta = extract_usage(lc_response)
+                    prompt_count = usage_meta["input_tokens"]
+                    output_count = usage_meta["output_tokens"]
+                    total_count = usage_meta["total_tokens"]
                     auth_header = request.headers.get("Authorization")
                     jwt = auth_header.split("Bearer ")[1] if auth_header and auth_header.startswith("Bearer ") else None
                     supabase_client = get_supabase_client(jwt)
-                    user_id = request.form.get("user_id")
-                    if not user_id and jwt:
-                        try:
-                            user_response = supabase_client.auth.get_user()
-                            if user_response and getattr(user_response, "user", None):
-                                user_id = user_response.user.id
-                        except Exception:
-                            pass
+                    verified_user_id = get_verified_user_id(jwt)
+                    user_id = verified_user_id or request.form.get("user_id")
                     if user_id is not None:
-                        parse_prompt_cost = compute_cost(prompt_count, output_count)
+                        parse_prompt_cost = compute_cost(prompt_count, output_count, DEFAULT_MODEL)
+                        token_row_id = str(uuid.uuid4())
                         supabase_client.table("tokens").insert({
-                            "id": str(uuid.uuid4()),
+                            "id": token_row_id,
                             "experiment_id": None,
                             "operation": "parse_pdf",
                             "user_id": user_id,
@@ -1009,6 +1135,8 @@ class ParsePDF(Resource):
                             "eval_cost": 0.0,
                             "total_cost": parse_prompt_cost,
                         }).execute()
+                        if verified_user_id:
+                            charge_and_record(verified_user_id, token_row_id, parse_prompt_cost)
                 except Exception as token_err:
                     logger.warning(f"[{request_id}] Failed to store token usage: {token_err}")
             except Exception as api_error:
@@ -1163,6 +1291,30 @@ class CheckoutVerify(Resource):
             return {"status": "error", "message": str(e)}, 502
 
 
+class Credits(Resource):
+    """
+    Return the authenticated user's balance (USD) plus the pricing parameters
+    the frontend needs to show credits, estimates and "free runs left".
+    """
+
+    def get(self):
+        user_id = get_verified_user_id(jwt_from_request())
+        if not user_id:
+            return {"status": "error", "message": "Unauthorized"}, 401
+        balance = get_balance(user_id)
+        if balance is None:
+            return {"status": "error", "message": "Could not read balance."}, 503
+        reserved = reserved_for_running(user_id)
+        return {
+            "free_usd": round(balance["free"], 6),
+            "paid_usd": round(balance["paid"], 6),
+            "total_usd": round(balance["total"], 6),
+            "reserved_usd": round(reserved, 6),
+            "available_usd": round(balance["total"] - reserved, 6),
+            **pricing_params(),
+        }
+
+
 # Register the resources with the API
 api.add_resource(Evaluation, "/evaluate")
 api.add_resource(Progress, "/progress")
@@ -1170,6 +1322,7 @@ api.add_resource(GenerateSteps, "/generate-steps")
 api.add_resource(ParsePDF, "/parse-pdf")
 api.add_resource(Checkout, "/checkout")
 api.add_resource(CheckoutVerify, "/checkout/verify")
+api.add_resource(Credits, "/credits")
 
 # Register the API blueprint with the Flask application
 app.register_blueprint(api_bp, url_prefix="/api")
