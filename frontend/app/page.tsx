@@ -15,6 +15,7 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/
 import { LogOut, MousePointer, Check, Lock, Brain, Users, Laptop, LineChart, Shield, Server, FileText, Edit, Trash2  } from "lucide-react"
 import { Card, CardContent } from "@/components/ui/card"
 import OneTapComponent from "./components/onetap"
+import EmailOtpLogin from "./components/EmailOtpLogin"
 import { supabase } from "./utils/supabase"
 import { useAuth } from "./hooks/useAuth"
 
@@ -191,8 +192,14 @@ export default function Home() {
                   </Link>
                 </div>
               ) : (
-                <div className="text-gray-500">
+                <div className="text-gray-500 flex flex-col items-start gap-4">
                   <OneTapComponent />
+                  <div className="flex w-[250px] items-center gap-3 text-xs text-gray-400">
+                    <div className="h-px flex-1 bg-gray-200" />
+                    or
+                    <div className="h-px flex-1 bg-gray-200" />
+                  </div>
+                  <EmailOtpLogin />
                 </div>
               )}
             </div>

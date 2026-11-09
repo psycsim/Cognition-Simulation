@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '../../utils/supabase'
+import { completeLogin } from '../../utils/postLogin'
 
 export default function AuthCallback() {
   const router = useRouter()
@@ -20,29 +21,7 @@ export default function AuthCallback() {
         }
 
         if (data.session?.user) {
-          // Store user data in localStorage for consistency with Google OAuth
-          localStorage.setItem('supabaseUser', JSON.stringify(data.session.user))
-          
-          // Push user data to user_emails table (same as Google OAuth)
-          try {
-            const { error: insertError } = await supabase
-              .from('user_emails')
-              .upsert({
-                uuid: crypto.randomUUID(),
-                user_email: data.session.user.email,
-                user_id: data.session.user.id,
-                pic_url: data.session.user.identities?.[0]?.identity_data?.avatar_url || 
-                         data.session.user.identities?.[0]?.identity_data?.picture || 
-                         null
-              },
-              { onConflict: 'user_email' });
-            
-            if (insertError) {
-              console.error('Error inserting user data:', insertError)
-            }
-          } catch (insertError) {
-            console.error('Error pushing user data to database:', insertError)
-          }
+          await completeLogin(data.session.user)
 
           // Redirect to dashboard
           router.push('/dashboard')

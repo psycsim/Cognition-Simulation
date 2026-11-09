@@ -4,6 +4,7 @@ import Script from 'next/script'
 import type { accounts, CredentialResponse } from 'google-one-tap'
 import { useRouter } from 'next/navigation'
 import { supabase } from '../utils/supabase'
+import { completeLogin } from '../utils/postLogin'
 
 declare const google: { accounts: accounts }
 
@@ -39,32 +40,8 @@ const OneTapComponent = () => {
 
           if (error) throw error
 
-          // Store user data in localStorage
           if (data.user) {
-            localStorage.setItem('supabaseUser', JSON.stringify(data.user))
-            
-            // Log the Supabase Auth UID and the user_id you are about to insert
-            const authUid = (await supabase.auth.getUser()).data.user?.id;
-            const incomingUserId = data.user.id;
-
-            // Push user data to user_emails table
-            try {
-              const { error: insertError } = await supabase
-                .from('user_emails')
-                .upsert({
-                  uuid: crypto.randomUUID(),
-                  user_email: data.user.email,
-                  user_id: data.user.id,
-                  pic_url: data.user.identities?.[0]?.identity_data?.avatar_url || data.user.identities?.[0]?.identity_data?.picture || null
-                },
-                { onConflict: 'user_email' });
-              
-              if (insertError) {
-                console.error('Error inserting user data:', insertError)
-              }
-            } catch (insertError) {
-              console.error('Error pushing user data to database:', insertError)
-            }
+            await completeLogin(data.user)
           }
 
           // redirect to protected page
