@@ -21,6 +21,8 @@ import {
   SimulationCharge,
   fetchSimulationCharges,
 } from "../utils/billingData";
+import { useCredits } from "../hooks/useCredits";
+import { formatCredits, runsLeft, REFERENCE_RUN, usdToCredits } from "../utils/credits";
 
 interface UserData {
   user_email: string;
@@ -89,15 +91,11 @@ type HistoryItem =
 const formatDate = (d: Date) =>
   d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
-// Default billing state mirrors the reference design so the tab is populated
-// out of the box. Replace with real balance/transactions once payments exist.
+// Balances come from the backend (/api/credits); `billing` only keeps the
+// browser-local purchase history.
 const defaultBilling: BillingData = {
-  balance: 47.5,
-  transactions: [
-    { id: "seed-1", label: "Credit purchase", date: "Apr 5, 2026", amount: 50 },
-    { id: "seed-2", label: "Credit purchase", date: "Mar 22, 2026", amount: 10 },
-    { id: "seed-3", label: "Credit purchase", date: "Mar 1, 2026", amount: 50 },
-  ],
+  balance: 0,
+  transactions: [],
 };
 
 // --- Profile persistence boundary -------------------------------------------
@@ -136,7 +134,13 @@ const loadBilling = (userId: string): BillingData => {
   if (typeof window === "undefined") return defaultBilling;
   try {
     const raw = localStorage.getItem(billingStorageKey(userId));
-    return raw ? (JSON.parse(raw) as BillingData) : defaultBilling;
+    if (!raw) return defaultBilling;
+    const parsed = JSON.parse(raw) as BillingData;
+    // Drop placeholder rows seeded by the old demo billing state.
+    return {
+      ...parsed,
+      transactions: (parsed.transactions || []).filter((t) => !t.id.startsWith("seed-")),
+    };
   } catch {
     return defaultBilling;
   }
@@ -154,6 +158,7 @@ const saveBilling = (userId: string, billing: BillingData) => {
 
 export default function AccountPage() {
   const { user, isLoading, isAuthenticated } = useAuth();
+  const { credits, refresh: refreshCredits } = useCredits(isAuthenticated);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [activeTab, setActiveTab] = useState<"profile" | "billing">("profile");
   const [isEditing, setIsEditing] = useState(false);
@@ -178,12 +183,11 @@ export default function AccountPage() {
     }
   };
 
-  // Total spent running simulations and the balance after subtracting it.
+  // Total spent so far (informational; the server balance is already net of it).
   const simulationSpent = useMemo(
     () => simCharges.reduce((sum, c) => sum + c.totalCost, 0),
     [simCharges]
   );
-  const availableBalance = Math.round((billing.balance - simulationSpent) * 100) / 100;
 
   // Unified, newest-first history: credit purchases (+) and simulation debits (−).
   const historyItems = useMemo<HistoryItem[]>(() => {
@@ -337,6 +341,7 @@ export default function AccountPage() {
     if (!user || !isAuthenticated) return;
     const params = new URLSearchParams(window.location.search);
     const status = params.get("status");
+    if (params.get("tab") === "billing") setActiveTab("billing");
     if (status !== "success" && status !== "cancel") return;
 
     setActiveTab("billing");
@@ -356,6 +361,7 @@ export default function AccountPage() {
         if (result.paid && result.amount > 0) {
           recordCredits(result.amount, result.balance);
           setCheckoutStatus("success");
+          void refreshCredits();
         } else {
           setCheckoutError("Payment could not be verified.");
         }
@@ -555,28 +561,58 @@ export default function AccountPage() {
 
               {/* Credit Balance */}
               <div className="bg-white rounded-xl border border-gray-200 p-6">
-                <p className="text-sm text-gray-500">Available Balance</p>
+                <p className="text-sm text-gray-500">Available Credits</p>
                 <div className="flex items-center gap-2 mt-1">
                   <Coins className="w-6 h-6 text-blue-600" />
-                  <span className="text-3xl font-bold text-blue-600">${availableBalance.toFixed(2)}</span>
+                  <span className="text-3xl font-bold text-blue-600">
+                    {credits ? formatCredits(credits.total_usd, credits) : "—"}
+                  </span>
+                  {credits && (
+                    <span className="text-sm text-gray-400 ml-1">
+                      (${credits.total_usd.toFixed(2)})
+                    </span>
+                  )}
                 </div>
-                {/* Credits purchased minus what simulations have cost so far. */}
-                <div className="mt-4 grid grid-cols-2 gap-4 border-t border-gray-100 pt-4">
+                <div className="mt-4 grid grid-cols-3 gap-4 border-t border-gray-100 pt-4">
                   <div>
-                    <p className="text-xs text-gray-400">Credits added</p>
+                    <p className="text-xs text-gray-400">Free credits</p>
                     <p className="text-sm font-semibold text-gray-900">
-                      ${billing.balance.toFixed(2)}
+                      {credits ? formatCredits(credits.free_usd, credits) : "—"}
+                    </p>
+                    {credits && credits.free_usd > 0 && (
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        ≈ {runsLeft(credits.free_usd, credits)} free runs left
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-400">Purchased credits</p>
+                    <p className="text-sm font-semibold text-gray-900">
+                      {credits ? formatCredits(credits.paid_usd, credits) : "—"}
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Spent on simulations</p>
+                    <p className="text-xs text-gray-400">Spent so far</p>
                     <p className="text-sm font-semibold text-red-600">
-                      -${simulationSpent.toFixed(2)}
+                      -{formatCredits(simulationSpent, credits)}
                     </p>
                   </div>
                 </div>
                 <p className="text-sm text-gray-500 mt-3">
-                  Credits are used for running simulations. Add funds anytime.
+                  $1 = {credits?.credits_per_usd ?? 100} credits. Free credits are used first. A typical run
+                  ({REFERENCE_RUN.samples} samples × {REFERENCE_RUN.steps} steps) costs about{" "}
+                  {credits
+                    ? Math.ceil(
+                        usdToCredits(
+                          credits.est_per_sample_step * REFERENCE_RUN.samples * REFERENCE_RUN.steps +
+                            credits.est_per_sample * REFERENCE_RUN.samples +
+                            credits.run_fee_usd,
+                          credits
+                        )
+                      )
+                    : 9}{" "}
+                  credits. You need at least {credits ? formatCredits(credits.min_balance_usd, credits) : 100} credits
+                  to start a run.
                 </p>
               </div>
 
@@ -588,7 +624,10 @@ export default function AccountPage() {
                   {/* $10 */}
                   <div className="border border-gray-200 rounded-xl p-5 flex flex-col">
                     <div className="flex-1 flex items-center justify-center py-3">
-                      <span className="text-2xl font-bold text-gray-900">$10</span>
+                      <div className="text-center">
+                        <span className="text-2xl font-bold text-gray-900">$10</span>
+                        <p className="text-xs text-gray-500 mt-1">{((10) * (credits?.credits_per_usd ?? 100)).toLocaleString("en-US")} credits</p>
+                      </div>
                     </div>
                     <button
                       onClick={() => handleAddCredits(10)}
@@ -606,7 +645,10 @@ export default function AccountPage() {
                       Most Popular
                     </span>
                     <div className="flex-1 flex items-center justify-center py-3">
-                      <span className="text-2xl font-bold text-gray-900">$50</span>
+                      <div className="text-center">
+                        <span className="text-2xl font-bold text-gray-900">$50</span>
+                        <p className="text-xs text-gray-500 mt-1">{((50) * (credits?.credits_per_usd ?? 100)).toLocaleString("en-US")} credits</p>
+                      </div>
                     </div>
                     <button
                       onClick={() => handleAddCredits(50)}
@@ -675,7 +717,7 @@ export default function AccountPage() {
                           </div>
                           <div className="flex items-center gap-4">
                             <span className="text-xs font-medium text-green-600 bg-green-50 px-2.5 py-1 rounded-md">
-                              +${item.amount.toFixed(2)}
+                              +{formatCredits(item.amount)} credits (${item.amount.toFixed(2)})
                             </span>
                             <button
                               type="button"
@@ -727,6 +769,10 @@ function SimulationRow({
   const outputTokens = charge.promptOutputToken + charge.evalOutputToken;
   const fmtTokens = (n: number) => n.toLocaleString("en-US");
   const fmtUsd = (n: number) => `$${n.toFixed(4)}`;
+  const fmtCredits = (usd: number) => {
+    const c = usdToCredits(usd);
+    return c >= 10 ? Math.round(c).toLocaleString("en-US") : c.toFixed(2);
+  };
 
   return (
     <div className="py-3">
@@ -753,7 +799,10 @@ function SimulationRow({
           </div>
         </div>
         <span className="text-xs font-medium text-red-600 bg-red-50 px-2.5 py-1 rounded-md">
-          -{fmtUsd(charge.totalCost)}
+          -{fmtCredits(charge.totalCost)} credits
+          {charge.freePortion != null && charge.freePortion > 0 && (
+            <span className="text-red-400"> (free)</span>
+          )}
         </span>
       </button>
 
@@ -791,15 +840,19 @@ function SimulationRow({
             <span className="text-right font-medium text-gray-900">
               {fmtUsd(charge.tokenCost)}
             </span>
-            <span className="text-gray-500">Server cost</span>
-            <span className="text-right font-medium text-gray-900">
-              {fmtUsd(charge.serverCost)}
-            </span>
+            {charge.serverCost > 0 && (
+              <>
+                <span className="text-gray-500">Server cost</span>
+                <span className="text-right font-medium text-gray-900">
+                  {fmtUsd(charge.serverCost)}
+                </span>
+              </>
+            )}
             <span className="mt-1 border-t border-gray-200 pt-1.5 font-semibold text-gray-900">
               Total
             </span>
             <span className="mt-1 border-t border-gray-200 pt-1.5 text-right font-semibold text-gray-900">
-              {fmtUsd(charge.totalCost)}
+              {fmtUsd(charge.totalCost)} · {fmtCredits(charge.totalCost)} credits
             </span>
           </div>
         </div>

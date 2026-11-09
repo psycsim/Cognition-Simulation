@@ -77,15 +77,30 @@ def get_llm(model_name: str, temperature: float = 0.0):
     raise ValueError(f"Unsupported model: {model_name}")
 
 
-def _extract_usage(raw_message) -> Dict[str, int]:
-    """Extract token usage from a LangChain AIMessage."""
+def extract_usage(raw_message) -> Dict[str, int]:
+    """
+    Extract billable token usage from a LangChain AIMessage.
+
+    Gemini bills thinking tokens at the output rate. Depending on the
+    langchain-google-genai version, ``output_tokens`` may or may not include
+    them, but ``total_tokens`` always does — so billable output is taken as
+    ``max(output_tokens, total_tokens - input_tokens)``.
+    """
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    if raw_message and hasattr(raw_message, "usage_metadata") and raw_message.usage_metadata:
-        meta = raw_message.usage_metadata
-        usage["input_tokens"] = meta.get("input_tokens", 0) or 0
-        usage["output_tokens"] = meta.get("output_tokens", 0) or 0
-        usage["total_tokens"] = meta.get("total_tokens", 0) or 0
+    meta = getattr(raw_message, "usage_metadata", None) if raw_message is not None else None
+    if meta:
+        input_tokens = meta.get("input_tokens", 0) or 0
+        output_tokens = meta.get("output_tokens", 0) or 0
+        total_tokens = meta.get("total_tokens", 0) or 0
+        output_tokens = max(output_tokens, total_tokens - input_tokens)
+        usage["input_tokens"] = input_tokens
+        usage["output_tokens"] = output_tokens
+        usage["total_tokens"] = max(total_tokens, input_tokens + output_tokens)
     return usage
+
+
+# Backwards-compatible alias
+_extract_usage = extract_usage
 
 
 def invoke_structured(

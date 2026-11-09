@@ -32,19 +32,17 @@ Required environment variables:
 - `VITE_GCP_TOKEN`: Authentication token for production
 - `DEV`: Set to 'development' for local development
 - `OPENAI_API_KEY` OpenAI API key
-- `GCP_BILLING_API_KEY`: (Optional) Google Cloud Billing Catalog API key for live Gemini 2.0 Flash pricing. If unset, uses fallback rates ($0.10/1M input, $0.40/1M output).
+- `SUPABASE_SERVICE_ROLE_KEY`: Required for billing (reading balances, charging runs, crediting Stripe purchases).
+
+Token pricing is a static table in `utils/pricing.py` (Gemini Developer API rates; gemini-2.5-flash: $0.30/1M input, $2.50/1M output incl. thinking). Update it when Google changes prices or a new model is added.
 
 ## Database Migration
 
-Before using cost tracking, run the migration to add `prompt_cost`, `eval_cost`, and `total_cost` columns to the `tokens` table:
+Credits/billing need `supabase/migrations/20261108000000_credits.sql` (repo root). Run it in the Supabase SQL Editor or with `supabase db push`. It:
 
-```bash
-# Via Supabase CLI (if configured)
-supabase db push
-
-# Or run the SQL manually in Supabase SQL Editor:
-# See supabase/migrations/20250301000000_add_tokens_cost_columns.sql
-```
+- adds `user_emails.free_credits` and grants $5 (500 credits) once to every existing and new user
+- blocks clients from writing their own balance (trigger)
+- adds `charge_user` / `add_paid_credits` RPCs (service role only) and `tokens.charged_amount` / `tokens.free_portion`
 
 ## Development
 

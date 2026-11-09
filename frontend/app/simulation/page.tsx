@@ -20,6 +20,11 @@ import IntroductionSelectionModal from "@/app/components/IntroductionSelectionMo
 import AddMeasureModal from "../components/AddMeasureModal";
 import type { Measure, MeasureDraft } from "../types/measure";
 import { createMeasure, mapMeasureRow } from "../utils/measures";
+import { toast } from "sonner";
+import Link from "next/link";
+import CreditsBanner from "../components/CreditsBanner";
+import { useCredits } from "../hooks/useCredits";
+import { canRun, estimateRunCredits, formatCredits, runsLeft } from "../utils/credits";
 
 type Sample = {
   id: string; // Changed to string for UUID
@@ -73,6 +78,7 @@ function SimulationPageContent() {
   const isNewSimulation = searchParams.get('new') === 'true';
   const folderIdParam = searchParams.get('folder');
   const { user, isLoading, isAuthenticated } = useAuth();
+  const { credits, refresh: refreshCredits } = useCredits(isAuthenticated);
   const [userData, setUserData] = useState<UserData | null>(null);
   const [processDescription, setProcessDescription] = useState(() =>
     readSimulationFromStorage() ? (localStorage.getItem('simulation-description') ?? '') : ''
@@ -674,6 +680,21 @@ function SimulationPageContent() {
       measures.filter(measure => selectedMeasureIds.includes(measure.id))
     ) as Step[];
 
+  // Rough credit estimate for the current design (samples × steps).
+  const stepCount = useMemo(() => {
+    try {
+      return convertFlowNodesToSteps(flowNodes, flowEdges).length;
+    } catch {
+      return 0;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flowNodes, flowEdges, measures]);
+  const runEstimate = useMemo(
+    () => (credits ? estimateRunCredits(Math.min(50, Math.max(10, sampleSize)), stepCount, credits) : null),
+    [credits, sampleSize, stepCount]
+  );
+  const hasEnoughCredits = canRun(credits);
+
   // Helper function to compare two experiment data objects
   // Returns true if they are identical (same title, sample.id, and steps)
   const areExperimentsIdentical = (original: any, newData: any): boolean => {
@@ -971,6 +992,16 @@ function SimulationPageContent() {
   const proceedWithSubmission = async () => {
     setShowNoMeasuresConfirm(false);
 
+    // Credit check (the backend enforces this too and returns 402).
+    const latestCredits = await refreshCredits();
+    if (latestCredits && !canRun(latestCredits)) {
+      toast.error("Not enough credits", {
+        description: `You need at least ${formatCredits(latestCredits.min_balance_usd, latestCredits)} credits to run a simulation.`,
+        action: { label: "Buy credits", onClick: () => router.push("/account?tab=billing") },
+      });
+      return;
+    }
+
     // Validate sample size (10-50) – use current input when focused, else committed value
     const rawSize = isSampleSizeFocused ? parseInt(sampleSizeInput.trim(), 10) : sampleSize;
     const isEmpty = sampleSizeInput.trim() === "";
@@ -1084,12 +1115,29 @@ function SimulationPageContent() {
           body: JSON.stringify({ id: uuid, data: jsonData }),
         });
 
-        const result = await response.json();
+        const result = await response.json().catch(() => ({}));
 
+        if (response.status === 402) {
+          const err = new Error(result.message || "Not enough credits to run this simulation.");
+          (err as any).insufficientCredits = true;
+          throw err;
+        }
         if (result.status !== "started") {
           throw new Error(result.message || "Simulation failed to start");
         }
-        // Success: state and localStorage already set; nothing else to do
+
+        // Success: tell the user how many free runs they have left.
+        const after = await refreshCredits();
+        if (after) {
+          const est = estimateRunCredits(jsonData.iters, orderedSteps.length, after);
+          const freeAfterUsd = Math.max(0, after.free_usd - after.reserved_usd);
+          toast.success("Simulation started", {
+            description:
+              after.free_usd > 0
+                ? `Estimated ~${est.expected} credits. About ${runsLeft(freeAfterUsd, after)} free runs left (${formatCredits(freeAfterUsd, after)} free credits).`
+                : `Estimated ~${est.expected} credits, charged from your purchased credits when the run finishes.`,
+          });
+        }
       } catch (error) {
         setIsSimulationRunning(false);
         setSimulationProgress(null);
@@ -1097,7 +1145,15 @@ function SimulationPageContent() {
         setShowSubmittedModal(false);
         localStorage.removeItem('simulation-task-id');
         localStorage.removeItem('simulation-pending');
-        alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        if ((error as any)?.insufficientCredits) {
+          void refreshCredits();
+          toast.error("Not enough credits", {
+            description: (error as Error).message,
+            action: { label: "Buy credits", onClick: () => router.push("/account?tab=billing") },
+          });
+        } else {
+          alert(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
       }
     })();
   };
@@ -1119,6 +1175,8 @@ function SimulationPageContent() {
     setSimulationProgress(null);
     localStorage.removeItem("simulation-task-id");
     localStorage.removeItem("simulation-pending");
+    // The charge is applied just after the run is marked Completed.
+    setTimeout(() => void refreshCredits(), 3000);
 
     if (progressState.isFailed) {
       alert("Simulation failed. Please check your experiment settings and try again.");
@@ -1659,6 +1717,7 @@ function SimulationPageContent() {
       headerTitle=""
       userData={userData}
     >
+      {!simulationHasBeenRun && <CreditsBanner credits={credits} />}
       {simulationHasBeenRun && (
         <div className="w-full bg-red-400/85 text-white px-2 py-1 text-center text-xs font-medium">
           This simulation has already been run and cannot be modified. You can copy the simulation from the dashboard and then edit the copy.
@@ -1672,6 +1731,21 @@ function SimulationPageContent() {
           {!simulationHasBeenRun && sampleIsUnbalanced && (
             <span className="text-xs text-red-600 max-w-[16rem] text-right leading-tight">
               The steps don’t use exactly 100% of the sample.
+            </span>
+          )}
+          {!simulationHasBeenRun && credits && !hasEnoughCredits && (
+            <span className="text-xs text-red-600 max-w-[16rem] text-right leading-tight">
+              You need at least {formatCredits(credits.min_balance_usd, credits)} credits to run.{" "}
+              <Link href="/account?tab=billing" className="underline font-medium">Buy credits</Link>
+            </span>
+          )}
+          {!simulationHasBeenRun && runEstimate && stepCount > 0 && (
+            <span
+              className="text-xs text-gray-500 text-right leading-tight whitespace-nowrap"
+              title={`Rough estimate for ${Math.min(50, Math.max(10, sampleSize))} samples × ${stepCount} steps, including the run fee. Actual cost depends on response length.`}
+            >
+              Est. cost: ~{runEstimate.expected} credits
+              <span className="text-gray-400"> ({runEstimate.low}–{runEstimate.high})</span>
             </span>
           )}
           <Button
@@ -1698,6 +1772,7 @@ function SimulationPageContent() {
               onClick={handleSubmitSimulation}
               disabled={
                 isSimulationRunning ||
+                (!!credits && !hasEnoughCredits) ||
                 !!titleError ||
                 sampleIsUnbalanced ||
                 (isSampleSizeFocused
@@ -1710,6 +1785,8 @@ function SimulationPageContent() {
               title={
                 sampleIsUnbalanced
                   ? "The steps don't use the whole sample. Fix the sample counts on the arrows to run the simulation."
+                  : credits && !hasEnoughCredits
+                  ? `You need at least ${formatCredits(credits.min_balance_usd, credits)} credits to run a simulation.`
                   : undefined
               }
               className="bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
